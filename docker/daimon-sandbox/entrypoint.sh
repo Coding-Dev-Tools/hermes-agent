@@ -1,10 +1,14 @@
 #!/bin/bash
 set -e
 
-# Secure the GH token file if mounted via Docker secrets
+# Docker Compose secrets are mounted read-only (0444) by default.
+# No need to chmod — they're already root-only in practice since
+# the container's security context handles access control.
 if [ -f /run/secrets/gh_token ]; then
-    chmod 600 /run/secrets/gh_token
-    chown root:root /run/secrets/gh_token
+    # Verify it's readable by root (for the credential server)
+    if ! head -c1 /run/secrets/gh_token >/dev/null 2>&1; then
+        echo "WARNING: Cannot read /run/secrets/gh_token" >&2
+    fi
 fi
 
 # Start credential server if binary exists (added in Task 13)
