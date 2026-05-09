@@ -175,12 +175,6 @@ class TestDiscordServerValidation:
         assert "error" in result
         assert "channel_id" in result["error"]
 
-    def test_missing_required_message_id_for_delete(self, monkeypatch):
-        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
-        result = json.loads(discord_admin_handler(action="delete_message", channel_id="11"))
-        assert "error" in result
-        assert "message_id" in result["error"]
-
     def test_missing_multiple_params(self, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
         result = json.loads(discord_admin_handler(action="add_role"))
@@ -413,10 +407,10 @@ class TestListPins:
 
 
 # ---------------------------------------------------------------------------
-# Actions: pin_message / unpin_message / delete_message
+# Actions: pin_message / unpin_message
 # ---------------------------------------------------------------------------
 
-class TestPinUnpinDelete:
+class TestPinUnpin:
     @patch("tools.discord_tool._discord_request")
     def test_pin_message(self, mock_req, monkeypatch):
         monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
@@ -431,16 +425,6 @@ class TestPinUnpinDelete:
         mock_req.return_value = None
         result = json.loads(discord_admin_handler(action="unpin_message", channel_id="11", message_id="500"))
         assert result["success"] is True
-        mock_req.assert_called_once_with("DELETE", "/channels/11/pins/500", "test-token")
-
-    @patch("tools.discord_tool._discord_request")
-    def test_delete_message(self, mock_req, monkeypatch):
-        monkeypatch.setenv("DISCORD_BOT_TOKEN", "test-token")
-        mock_req.return_value = None
-        result = json.loads(discord_admin_handler(action="delete_message", channel_id="11", message_id="500"))
-        assert result["success"] is True
-        assert "deleted" in result["message"]
-        mock_req.assert_called_once_with("DELETE", "/channels/11/messages/500", "test-token")
 
 
 # ---------------------------------------------------------------------------
@@ -602,7 +586,6 @@ class TestRegistration:
         desc = entry.schema["description"]
         assert "list_guilds()" in desc
         assert "add_role(guild_id, user_id, role_id)" in desc
-        assert "delete_message(channel_id, message_id)" in desc
         # Core actions should NOT be in admin description
         assert "fetch_messages(" not in desc
         assert "create_thread(" not in desc

@@ -148,15 +148,8 @@ You should see something like `10 results`. If you get a `403 Forbidden`, JSON f
 **7. Configure Hermes:**
 
 ```bash
-# ~/.hermes/.env
-SEARXNG_URL=http://localhost:8888
-```
-
-Then select SearXNG as the search backend in `~/.hermes/config.yaml`:
-
-```yaml
-web:
-  search_backend: "searxng"
+# ~/.hermes/config.yaml
+SEARXNG_URL: http://localhost:8888
 ```
 
 Or set via `hermes tools` → Web Search & Extract → SearXNG.
@@ -168,8 +161,8 @@ Or set via `hermes tools` → Web Search & Extract → SearXNG.
 Public SearXNG instances are listed at [searx.space](https://searx.space/). Filter by instances that have **JSON format enabled** (shown in the table).
 
 ```bash
-# ~/.hermes/.env
-SEARXNG_URL=https://searx.example.com
+# ~/.hermes/config.yaml
+SEARXNG_URL: https://searx.example.com
 ```
 
 :::caution Public instances

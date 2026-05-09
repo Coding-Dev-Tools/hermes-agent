@@ -1,4 +1,4 @@
-"""Base class for all Hermes execution environment backends.
+﻿"""Base class for all Hermes execution environment backends.
 
 Unified spawn-per-call model: every command spawns a fresh ``bash -c`` process.
 A session snapshot (env vars, functions, aliases) is captured once at init and
@@ -10,6 +10,7 @@ import codecs
 import json
 import logging
 import os
+import platform
 import select
 import shlex
 import subprocess
@@ -200,7 +201,7 @@ class _ThreadedProcessHandle:
         self._returncode: int | None = None
         self._error: Exception | None = None
 
-        # Pipe for stdout — drain thread in _wait_for_process reads the read end.
+        # Pipe for stdout â€” drain thread in _wait_for_process reads the read end.
         read_fd, write_fd = os.pipe()
         self._stdout = os.fdopen(read_fd, "r", encoding="utf-8", errors="replace")
         self._write_fd = write_fd
@@ -362,7 +363,7 @@ class BaseEnvironment(ABC):
             )
         except Exception as exc:
             logger.warning(
-                "init_session failed (session=%s): %s — "
+                "init_session failed (session=%s): %s â€” "
                 "falling back to bash -l per command",
                 self._session_id,
                 exc,
@@ -373,15 +374,40 @@ class BaseEnvironment(ABC):
     # Command wrapping
     # ------------------------------------------------------------------
 
+    _IS_WINDOWS = platform.system() == "Windows"
+
     @staticmethod
-    def _quote_cwd_for_cd(cwd: str) -> str:
-        """Quote a ``cd`` target while preserving ``~`` expansion."""
+    def _win_to_unix_path(path: str) -> str:
+        """Convert a Windows path (C:\\Users\\...) to Git Bash Unix style (/c/Users/...).
+
+        Git Bash on Windows uses Unix-style mount paths. When the session
+        snapshot is sourced, ``export -p`` re-emits env vars with Windows
+        backslash paths; those backslashes get consumed by the shell, which
+        corrupts subsequent ``cd`` targets. Converting to Unix-style avoids
+        this entirely.
+        """
+        import re
+        m = re.match(r"^([A-Za-z]):[/\\](.*)", path)
+        if m:
+            drive = m.group(1).lower()
+            rest = m.group(2).replace("\\", "/")
+            return f"/{drive}/{rest}"
+        return path.replace("\\", "/")
+
+    def _quote_cwd_for_cd(self, cwd: str) -> str:
+        """Quote a ``cd`` target while preserving ``~`` expansion.
+
+        On Windows (Git Bash), converts backslash paths to Unix-style first
+        so the ``cd`` builtin can resolve them after the snapshot is sourced.
+        """
         if cwd == "~":
             return cwd
         if cwd == "~/":
             return "$HOME"
         if cwd.startswith("~/"):
             return f"$HOME/{shlex.quote(cwd[2:])}"
+        if BaseEnvironment._IS_WINDOWS:
+            cwd = BaseEnvironment._win_to_unix_path(cwd)
         return shlex.quote(cwd)
 
     def _wrap_command(self, command: str, cwd: str) -> str:
@@ -446,7 +472,7 @@ class BaseEnvironment(ABC):
     def _wait_for_process(self, proc: ProcessHandle, timeout: int = 120) -> dict:
         """Poll-based wait with interrupt checking and stdout draining.
 
-        Shared across all backends — not overridden.
+        Shared across all backends â€” not overridden.
 
         Fires the ``activity_callback`` (if set on this instance) every 10s
         while the process is running so the gateway's inactivity timeout
@@ -456,19 +482,19 @@ class BaseEnvironment(ABC):
         call ``self._kill_process(proc)`` if we exit via ``KeyboardInterrupt``
         or ``SystemExit``.  Without this, the local backend (which spawns
         subprocesses with ``os.setsid`` into their own process group) leaves
-        an orphan with ``PPID=1`` when python is shut down mid-tool — the
+        an orphan with ``PPID=1`` when python is shut down mid-tool â€” the
         ``sleep 300``-survives-30-min bug Physikal and I both hit.
         """
         output_chunks: list[str] = []
 
         # Non-blocking drain via select().
         #
-        # The old pattern — ``for line in proc.stdout`` — blocks on
+        # The old pattern â€” ``for line in proc.stdout`` â€” blocks on
         # ``readline()`` until the pipe reaches EOF.  When the user's command
         # backgrounds a process (``cmd &``, ``setsid cmd & disown``, etc.),
         # that backgrounded grandchild inherits the write-end of our stdout
         # pipe via ``fork()``.  Even after ``bash`` itself exits, the pipe
-        # stays open because the grandchild still holds it — so the drain
+        # stays open because the grandchild still holds it â€” so the drain
         # thread never returns and the tool hangs for the full lifetime of
         # the grandchild (issue #8340: users reported indefinite hangs when
         # restarting uvicorn with ``setsid ... & disown``).
@@ -476,7 +502,7 @@ class BaseEnvironment(ABC):
         # The fix: select() with a short poll interval, and stop draining
         # shortly after ``bash`` exits even if the pipe hasn't EOF'd yet.
         # Any output the grandchild writes after that point goes to an
-        # orphaned pipe (harmless — the kernel reaps it when our end closes).
+        # orphaned pipe (harmless â€” the kernel reaps it when our end closes).
         #
         # Decoding: we ``os.read()`` raw bytes in fixed-size chunks (4096)
         # so a single multibyte UTF-8 character can split across reads.  An
@@ -489,26 +515,6 @@ class BaseEnvironment(ABC):
 
         def _drain():
             fd = proc.stdout.fileno()
-            # select.select does NOT work on pipe fds on Windows (only sockets).
-            # Use blocking os.read in a daemon thread instead — safe because
-            # EOF arrives promptly when bash exits.
-            if os.name == "nt":
-                try:
-                    while True:
-                        chunk = os.read(fd, 4096)
-                        if not chunk:
-                            break
-                        output_chunks.append(decoder.decode(chunk))
-                except (ValueError, OSError):
-                    pass
-                finally:
-                    try:
-                        tail = decoder.decode(b"", final=True)
-                        if tail:
-                            output_chunks.append(tail)
-                    except Exception:
-                        pass
-                return
             idle_after_exit = 0
             try:
                 while True:
@@ -522,13 +528,13 @@ class BaseEnvironment(ABC):
                         except (ValueError, OSError):
                             break
                         if not chunk:
-                            break  # true EOF — all writers closed
+                            break  # true EOF â€” all writers closed
                         output_chunks.append(decoder.decode(chunk))
                         idle_after_exit = 0
                     elif proc.poll() is not None:
                         # bash is gone and the pipe was idle for ~100ms.  Give
                         # it two more cycles to catch any buffered tail, then
-                        # stop — otherwise we wait forever on a grandchild pipe.
+                        # stop â€” otherwise we wait forever on a grandchild pipe.
                         idle_after_exit += 1
                         if idle_after_exit >= 3:
                             break
@@ -578,7 +584,7 @@ class BaseEnvironment(ABC):
                     if _DEBUG_INTERRUPT:
                         logger.info(
                             "[interrupt-debug] _wait_for_process INTERRUPT DETECTED "
-                            "tid=%s pid=%s iter=%d elapsed=%.1fs — killing process group",
+                            "tid=%s pid=%s iter=%d elapsed=%.1fs â€” killing process group",
                             _tid, _pid, _iter_count, time.monotonic() - _activity_state["start"],
                         )
                     self._kill_process(proc)
@@ -629,7 +635,7 @@ class BaseEnvironment(ABC):
         except (KeyboardInterrupt, SystemExit):
             # Signal arrived (SIGTERM/SIGHUP/SIGINT) or sys.exit() was called
             # while we were polling.  The local backend spawns subprocesses
-            # with os.setsid, which puts them in their own process group — so
+            # with os.setsid, which puts them in their own process group â€” so
             # if we let the interrupt propagate without killing the child,
             # python exits and the child is reparented to init (PPID=1) and
             # keeps running as an orphan.  Killing the process group here
@@ -637,7 +643,7 @@ class BaseEnvironment(ABC):
             if _DEBUG_INTERRUPT:
                 logger.info(
                     "[interrupt-debug] _wait_for_process EXCEPTION_EXIT "
-                    "tid=%s pid=%s iter=%d elapsed=%.1fs — killing subprocess group before re-raise",
+                    "tid=%s pid=%s iter=%d elapsed=%.1fs â€” killing subprocess group before re-raise",
                     _tid, _pid, _iter_count,
                     time.monotonic() - _activity_state["start"],
                 )
@@ -727,7 +733,7 @@ class BaseEnvironment(ABC):
 
         Remote backends (SSH, Modal, Daytona) override this to trigger
         their FileSyncManager.  Bind-mount backends (Docker, Singularity)
-        and Local don't need file sync — the host filesystem is directly
+        and Local don't need file sync â€” the host filesystem is directly
         visible inside the container/process.
         """
         pass
@@ -752,7 +758,7 @@ class BaseEnvironment(ABC):
         # subshell for the compound that then waits for an infinite B (a
         # server, `yes > /dev/null`, etc.), leaking the subshell forever.
         # Rewriting to `A && { B & }` runs B as a plain background in the
-        # current shell — no subshell wait.
+        # current shell â€” no subshell wait.
         from tools.terminal_tool import _rewrite_compound_background
         exec_command = _rewrite_compound_background(exec_command)
         effective_timeout = timeout or self.timeout
@@ -803,4 +809,5 @@ class BaseEnvironment(ABC):
         from tools.terminal_tool import _transform_sudo_command
 
         return _transform_sudo_command(command)
+
 

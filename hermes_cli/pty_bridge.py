@@ -26,19 +26,29 @@ Design constraints:
 from __future__ import annotations
 
 import errno
-import fcntl
 import os
 import select
-import signal
 import struct
 import sys
-import termios
 import time
 from typing import Optional, Sequence
 
 try:
+    import fcntl
+    import termios
+    _HAS_PTY_SYSCALLS = True
+except ImportError:
+    fcntl = None  # type: ignore
+    termios = None  # type: ignore
+    _HAS_PTY_SYSCALLS = False
+
+import signal
+# SIGHUP is missing on Windows; fall back to SIGTERM or skip.
+_SIGHUP = getattr(signal, "SIGHUP", signal.SIGTERM)
+
+try:
     import ptyprocess  # type: ignore
-    _PTY_AVAILABLE = not sys.platform.startswith("win")
+    _PTY_AVAILABLE = _HAS_PTY_SYSCALLS and not sys.platform.startswith("win")
 except ImportError:  # pragma: no cover - dev env without ptyprocess
     ptyprocess = None  # type: ignore
     _PTY_AVAILABLE = False
@@ -187,7 +197,7 @@ class PtyBridge:
 
     def resize(self, cols: int, rows: int) -> None:
         """Forward a terminal resize to the child via ``TIOCSWINSZ``."""
-        if self._closed:
+        if self._closed or not _HAS_PTY_SYSCALLS:
             return
         # struct winsize: rows, cols, xpixel, ypixel (all unsigned short)
         winsize = struct.pack("HHHH", max(1, rows), max(1, cols), 0, 0)
@@ -210,7 +220,7 @@ class PtyBridge:
 
         # SIGHUP is the conventional "your terminal went away" signal.
         # We escalate if the child ignores it.
-        for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGKILL):
+        for sig in (_SIGHUP, signal.SIGTERM, signal.SIGKILL):
             if not self._proc.isalive():
                 break
             try:

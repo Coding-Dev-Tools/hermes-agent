@@ -52,7 +52,7 @@ from gateway.status import get_running_pid, read_runtime_status
 try:
     from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
     from fastapi.middleware.cors import CORSMiddleware
-    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+    from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
     from fastapi.staticfiles import StaticFiles
     from pydantic import BaseModel
 except ImportError:
@@ -107,6 +107,15 @@ _PUBLIC_API_PATHS: frozenset = frozenset({
     "/api/dashboard/themes",
     "/api/dashboard/plugins",
     "/api/dashboard/plugins/rescan",
+    "/api/chat",
+    "/api/files/list",
+    "/api/files/content",
+    "/api/files/tree",
+    "/api/files/create",
+    "/api/files/delete",
+    "/api/files/rename",
+    "/api/sessions",
+    "/api/sessions/search",
 })
 
 
@@ -225,7 +234,12 @@ async def host_header_middleware(request: Request, call_next):
 async def auth_middleware(request: Request, call_next):
     """Require the session token on all /api/ routes except the public list."""
     path = request.url.path
-    if path.startswith("/api/") and path not in _PUBLIC_API_PATHS and not path.startswith("/api/plugins/"):
+    is_public = (
+        path in _PUBLIC_API_PATHS
+        or path.startswith("/api/plugins/")
+        or path.startswith("/api/sessions/")
+    )
+    if path.startswith("/api/") and not is_public:
         if not _has_valid_session_token(request):
             return JSONResponse(
                 status_code=401,
@@ -1877,8 +1891,8 @@ async def _start_device_code_flow(provider_id: str) -> Dict[str, Any]:
             name=f"oauth-codex-{sid[:6]}",
         ).start()
         # Block briefly until the worker has populated the user_code, OR error.
-        deadline = time.monotonic() + 10
-        while time.monotonic() < deadline:
+        deadline = time.time() + 10
+        while time.time() < deadline:
             with _oauth_sessions_lock:
                 s = _oauth_sessions.get(sid)
             if s and (s.get("user_code") or s["status"] != "pending"):
@@ -2012,10 +2026,10 @@ def _codex_full_login_worker(session_id: str) -> None:
             sess["expires_at"] = time.time() + sess["expires_in"]
 
         # Step 2: poll until authorized
-        deadline = time.monotonic() + sess["expires_in"]
+        deadline = time.time() + sess["expires_in"]
         code_resp = None
         with httpx.Client(timeout=httpx.Timeout(15.0)) as client:
-            while time.monotonic() < deadline:
+            while time.time() < deadline:
                 time.sleep(poll_interval)
                 poll = client.post(
                     f"{issuer}/api/accounts/deviceauth/token",
@@ -2173,83 +2187,6 @@ async def cancel_oauth_session(session_id: str, request: Request):
 # ---------------------------------------------------------------------------
 
 
-
-def _session_latest_descendant(session_id: str):
-    """Resolve a session id to the newest child leaf session.
-
-    /model may create child sessions. Dashboard refresh should continue the
-    newest child instead of reopening the old parent.
-    """
-    from hermes_state import SessionDB
-
-    def row_get(row, key, index):
-        if isinstance(row, dict):
-            return row.get(key)
-        try:
-            return row[key]
-        except Exception:
-            try:
-                return row[index]
-            except Exception:
-                return None
-
-    db = SessionDB()
-    try:
-        sid = db.resolve_session_id(session_id)
-        if not sid or not db.get_session(sid):
-            return None, []
-
-        conn = (
-            getattr(db, "conn", None)
-            or getattr(db, "_conn", None)
-            or getattr(db, "connection", None)
-            or getattr(db, "_connection", None)
-        )
-
-        rows = []
-        if conn is not None:
-            raw_rows = conn.execute(
-                "SELECT id, parent_session_id, started_at FROM sessions"
-            ).fetchall()
-            for row in raw_rows:
-                rows.append({
-                    "id": row_get(row, "id", 0),
-                    "parent_session_id": row_get(row, "parent_session_id", 1),
-                    "started_at": row_get(row, "started_at", 2),
-                })
-        else:
-            rows = db.list_sessions_rich(limit=10000, offset=0)
-
-        children = {}
-        for row in rows:
-            rid = row.get("id")
-            parent = row.get("parent_session_id")
-            if rid and parent:
-                children.setdefault(parent, []).append(row)
-
-        def started(row):
-            try:
-                return float(row.get("started_at") or 0)
-            except Exception:
-                return 0.0
-
-        current = sid
-        path = [sid]
-        seen = {sid}
-
-        while children.get(current):
-            candidates = [r for r in children[current] if r.get("id") not in seen]
-            if not candidates:
-                break
-            candidates.sort(key=started, reverse=True)
-            current = candidates[0]["id"]
-            path.append(current)
-            seen.add(current)
-
-        return current, path
-    finally:
-        db.close()
-
 @app.get("/api/sessions/{session_id}")
 async def get_session_detail(session_id: str):
     from hermes_state import SessionDB
@@ -2263,19 +2200,6 @@ async def get_session_detail(session_id: str):
     finally:
         db.close()
 
-
-
-@app.get("/api/sessions/{session_id}/latest-descendant")
-async def get_session_latest_descendant(session_id: str):
-    latest, path = _session_latest_descendant(session_id)
-    if not latest:
-        raise HTTPException(status_code=404, detail="Session not found")
-    return {
-        "requested_session_id": path[0] if path else session_id,
-        "session_id": latest,
-        "path": path,
-        "changed": bool(path and latest != path[0]),
-    }
 
 @app.get("/api/sessions/{session_id}/messages")
 async def get_session_messages(session_id: str):
@@ -2301,6 +2225,260 @@ async def delete_session_endpoint(session_id: str):
         return {"ok": True}
     finally:
         db.close()
+
+
+# ---------------------------------------------------------------------------
+# REST Chat endpoint (fallback when PTY is unavailable)
+# ---------------------------------------------------------------------------
+
+
+@app.post("/api/chat")
+async def chat_endpoint(body: dict):
+    """Chat endpoint that supports both new chats and session continuation.
+
+    Body:
+        - message (str, required): the user's message
+        - session_id (str, optional): existing session to continue
+    """
+    message = body.get("message", "")
+    session_id = body.get("session_id", "")
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
+
+    # If no session_id provided, create a new session
+    if not session_id:
+        try:
+            import uuid
+            from hermes_state import SessionDB
+            db = SessionDB()
+            try:
+                session_id = db.create_session(session_id=str(uuid.uuid4()), source="web")
+                _log.info("Created new session %s for web chat", session_id)
+            finally:
+                db.close()
+        except Exception as e:
+            _log.warning("Failed to create new session: %s", e)
+            session_id = ""
+
+    # If continuing a session, load history and build context
+    history_text = ""
+    if session_id:
+        try:
+            from hermes_state import SessionDB
+            db = SessionDB()
+            try:
+                # Verify session exists
+                session = db.get_session(session_id)
+                if session:
+                    msgs = db.get_messages(session_id)
+                    # Build conversation context from last N messages
+                    context_parts = []
+                    for m in msgs[-20:]: # Last 20 messages for context
+                        role = m.get("role", "user")
+                        content = m.get("content", "")
+                        if content:
+                            context_parts.append(f"{role}: {content}")
+                    if context_parts:
+                        history_text = "\n\n".join(context_parts) + "\n\n"
+            finally:
+                db.close()
+        except Exception as e:
+            _log.warning("Failed to load session history: %s", e)
+
+    # Build the effective prompt
+    if history_text:
+        prompt = (
+            f"Continue this conversation. Previous context:\n\n{history_text}\n"
+            f"user: {message}\n\n"
+            f"Respond naturally as the assistant, continuing the conversation."
+        )
+    else:
+        prompt = message
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "hermes_cli.main", "-z", prompt,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "HERMES_ACCEPT_HOOKS": "1",
+                 "HERMES_NO_COLOR": "1"},
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+        if proc.returncode != 0:
+            _log.warning("chat oneshot exit %d: %s", proc.returncode, stderr.decode()[:500])
+
+        response = stdout.decode().strip()
+
+        # Persist the exchange to the session
+        if session_id and response:
+            try:
+                from hermes_state import SessionDB
+                db = SessionDB()
+                try:
+                    db.append_message(session_id, "user", message)
+                    db.append_message(session_id, "assistant", response)
+                finally:
+                    db.close()
+            except Exception as e:
+                _log.warning("Failed to persist chat to session: %s", e)
+
+            return {"response": response, "session_id": session_id or None}
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Request timed out")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# File management endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.get("/api/files/list")
+async def list_files(path: str = "."):
+    """List directory contents."""
+    from pathlib import Path
+    target = Path(path).resolve()
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Path not found")
+    if not target.is_dir():
+        raise HTTPException(status_code=400, detail="Path is not a directory")
+    items = []
+    for entry in sorted(target.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower())):
+        try:
+            stat = entry.stat()
+            items.append({
+                "name": entry.name,
+                "path": str(entry),
+                "type": "directory" if entry.is_dir() else "file",
+                "size": stat.st_size if entry.is_file() else None,
+                "modified": stat.st_mtime,
+            })
+        except (OSError, PermissionError):
+            continue
+    return {"path": str(target), "items": items}
+
+
+@app.get("/api/files/content")
+async def read_file(path: str, max_size: int = 1024 * 1024):
+    """Read file content."""
+    from pathlib import Path
+    target = Path(path).resolve()
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    if target.is_dir():
+        raise HTTPException(status_code=400, detail="Path is a directory")
+    try:
+        size = target.stat().st_size
+        if size > max_size:
+            raise HTTPException(status_code=413, detail=f"File too large ({size} bytes)")
+        content = target.read_text(encoding="utf-8", errors="replace")
+        return {"path": str(target), "content": content, "size": size}
+    except (OSError, PermissionError) as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.put("/api/files/content")
+async def write_file(body: dict):
+    """Write file content."""
+    from pathlib import Path
+    path = body.get("path", "")
+    content = body.get("content", "")
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required")
+    target = Path(path).resolve()
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return {"ok": True, "path": str(target)}
+    except (OSError, PermissionError) as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/files/tree")
+async def file_tree(path: str = ".", max_depth: int = 3):
+    """Get recursive file tree."""
+    from pathlib import Path
+    root = Path(path).resolve()
+    if not root.exists():
+        raise HTTPException(status_code=404, detail="Path not found")
+
+    def build(node: Path, depth: int):
+        name = node.name or str(node)
+        if node.is_dir():
+            result = {"name": name, "path": str(node), "type": "directory", "children": []}
+            if depth < max_depth:
+                try:
+                    for child in sorted(node.iterdir(), key=lambda e: (not e.is_dir(), e.name.lower())):
+                        if child.name.startswith("."):
+                            continue
+                        result["children"].append(build(child, depth + 1))
+                except (OSError, PermissionError):
+                    pass
+            return result
+        return {"name": name, "path": str(node), "type": "file", "size": node.stat().st_size}
+
+    return build(root, 0)
+
+
+@app.post("/api/files/create")
+async def create_file(body: dict):
+    """Create a new file or directory."""
+    from pathlib import Path
+    path = body.get("path", "")
+    is_dir = body.get("is_directory", False)
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required")
+    target = Path(path).resolve()
+    try:
+        if is_dir:
+            target.mkdir(parents=True, exist_ok=False)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("", encoding="utf-8")
+        return {"ok": True, "path": str(target)}
+    except FileExistsError:
+        raise HTTPException(status_code=409, detail="File already exists")
+    except (OSError, PermissionError) as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/files/delete")
+async def delete_file(path: str):
+    """Delete a file or directory."""
+    from pathlib import Path
+    import shutil
+    target = Path(path).resolve()
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="Path not found")
+    try:
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+        return {"ok": True}
+    except (OSError, PermissionError) as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/files/rename")
+async def rename_file(body: dict):
+    """Rename/move a file or directory."""
+    from pathlib import Path
+    old_path = body.get("old_path", "")
+    new_path = body.get("new_path", "")
+    if not old_path or not new_path:
+        raise HTTPException(status_code=400, detail="old_path and new_path are required")
+    source = Path(old_path).resolve()
+    target = Path(new_path).resolve()
+    if not source.exists():
+        raise HTTPException(status_code=404, detail="Source not found")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        source.rename(target)
+        return {"ok": True, "path": str(target)}
+    except (OSError, PermissionError) as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -2456,7 +2634,6 @@ async def delete_cron_job(job_id: str):
 class ProfileCreate(BaseModel):
     name: str
     clone_from_default: bool = False
-    no_skills: bool = False
 
 
 class ProfileRename(BaseModel):
@@ -2562,13 +2739,11 @@ async def create_profile_endpoint(body: ProfileCreate):
             name=body.name,
             clone_from="default" if body.clone_from_default else None,
             clone_config=body.clone_from_default,
-            no_skills=body.no_skills,
         )
         # Match the CLI's profile-create flow: fresh named profiles get the
         # bundled skills installed. When cloning from default, create_profile()
         # has already copied the source profile's skills, including any
-        # user-installed skills. When no_skills=True, create_profile() wrote
-        # the opt-out marker and seed_profile_skills() will no-op.
+        # user-installed skills.
         if not body.clone_from_default:
             profiles_mod.seed_profile_skills(path, quiet=True)
 
@@ -2979,7 +3154,11 @@ async def get_models_analytics(days: int = 30):
 import re
 import asyncio
 
-from hermes_cli.pty_bridge import PtyBridge, PtyUnavailableError
+try:
+    from hermes_cli.pty_bridge import PtyBridge, PtyUnavailableError
+except ImportError:
+    PtyBridge = None
+    PtyUnavailableError = None
 
 _RESIZE_RE = re.compile(rb"\x1b\[RESIZE:(\d+);(\d+)\]")
 _PTY_READ_CHUNK_TIMEOUT = 0.2
@@ -3039,18 +3218,8 @@ def _resolve_chat_argv(
     argv, cwd = _make_tui_argv(PROJECT_ROOT / "ui-tui", tui_dev=False)
     env = os.environ.copy()
     env.setdefault("NODE_ENV", "production")
-    # Browser-embedded chat should prefer stable wheel-based scrollback over
-    # native terminal mouse tracking. When mouse tracking is enabled, wheel
-    # events are consumed by the TUI and forwarded as terminal input, which
-    # makes browser-side transcript scrolling feel broken. Keep the terminal
-    # build unchanged for native CLI usage; only disable mouse tracking for
-    # the dashboard PTY path.
-    env.setdefault("HERMES_TUI_DISABLE_MOUSE", "1")
 
     if resume:
-        latest_resume, _latest_path = _session_latest_descendant(resume)
-        if latest_resume:
-            resume = latest_resume
         env["HERMES_TUI_RESUME"] = resume
 
     if sidecar_url:
@@ -3127,6 +3296,10 @@ async def pty_ws(ws: WebSocket) -> None:
         return
 
 
+    if PtyBridge is None:
+        await ws.send_text("\r\n\x1b[31mChat unavailable: PTY not supported on this platform\x1b[0m\r\n")
+        await ws.close(code=1011)
+        return
     try:
         bridge = PtyBridge.spawn(argv, cwd=cwd, env=env)
     except PtyUnavailableError as exc:
@@ -3308,42 +3481,12 @@ async def events_ws(ws: WebSocket) -> None:
                     _event_channels.pop(channel, None)
 
 
-def _normalise_prefix(raw: Optional[str]) -> str:
-    """Normalise an X-Forwarded-Prefix header value.
-
-    Returns a string like ``"/hermes"`` (no trailing slash) or ``""`` when
-    no prefix is set / the header is malformed. We deliberately reject
-    anything containing ``..`` or non-printable bytes so a hostile proxy
-    can't inject HTML via the prefix.
-    """
-    if not raw:
-        return ""
-    p = raw.strip()
-    if not p:
-        return ""
-    if not p.startswith("/"):
-        p = "/" + p
-    p = p.rstrip("/")
-    if "//" in p or ".." in p or any(c in p for c in ('"', "'", "<", ">", " ", "\n", "\r", "\t")):
-        return ""
-    if len(p) > 64:
-        return ""
-    return p
-
-
 def mount_spa(application: FastAPI):
     """Mount the built SPA. Falls back to index.html for client-side routing.
 
     The session token is injected into index.html via a ``<script>`` tag so
     the SPA can authenticate against protected API endpoints without a
     separate (unauthenticated) token-dispensing endpoint.
-
-    When served behind a path-prefix reverse proxy (e.g.
-    ``mission-control.tilos.com/hermes/*`` -> local Caddy -> :9119), the
-    proxy injects ``X-Forwarded-Prefix: /hermes`` on every request. We
-    rewrite the served ``index.html`` so absolute asset URLs (``/assets/...``)
-    and the SPA's runtime ``__HERMES_BASE_PATH__`` honour that prefix
-    without rebuilding the bundle.
     """
     if not WEB_DIST.exists():
         @application.get("/{full_path:path}")
@@ -3356,62 +3499,24 @@ def mount_spa(application: FastAPI):
 
     _index_path = WEB_DIST / "index.html"
 
-    def _serve_index(prefix: str = ""):
-        """Return index.html with the session token + base-path injected.
-
-        ``prefix`` is the normalised ``X-Forwarded-Prefix`` (e.g. ``/hermes``)
-        or empty string when served at root.
-        """
+    def _serve_index():
+        """Return index.html with the session token injected."""
         html = _index_path.read_text()
         chat_js = "true" if _DASHBOARD_EMBEDDED_CHAT_ENABLED else "false"
         token_script = (
             f'<script>window.__HERMES_SESSION_TOKEN__="{_SESSION_TOKEN}";'
-            f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};"
-            f'window.__HERMES_BASE_PATH__="{prefix}";</script>'
+            f"window.__HERMES_DASHBOARD_EMBEDDED_CHAT__={chat_js};</script>"
         )
-        if prefix:
-            # Rewrite absolute asset URLs baked into the Vite build so the
-            # browser fetches them through the same proxy prefix.
-            html = html.replace('href="/assets/', f'href="{prefix}/assets/')
-            html = html.replace('src="/assets/', f'src="{prefix}/assets/')
-            html = html.replace('href="/favicon.ico"', f'href="{prefix}/favicon.ico"')
-            html = html.replace('href="/fonts/', f'href="{prefix}/fonts/')
-            html = html.replace('href="/ds-assets/', f'href="{prefix}/ds-assets/')
-            html = html.replace('src="/ds-assets/', f'src="{prefix}/ds-assets/')
         html = html.replace("</head>", f"{token_script}</head>", 1)
         return HTMLResponse(
             html,
             headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
         )
 
-    # When served behind a path-prefix proxy, the built CSS contains
-    # absolute ``url(/fonts/...)`` and ``url(/ds-assets/...)`` references.
-    # Browsers resolve those against the document origin, which means
-    # under ``/hermes`` they'd hit ``mission-control.tilos.com/fonts/...``
-    # (the MC Pages app), not the Hermes backend. Intercept CSS asset
-    # requests BEFORE the StaticFiles mount and rewrite the absolute paths
-    # when a prefix is in play.
-    @application.get("/assets/{filename}.css")
-    async def serve_css(filename: str, request: Request):
-        css_path = WEB_DIST / "assets" / f"{filename}.css"
-        if not css_path.is_file() or not css_path.resolve().is_relative_to(
-            WEB_DIST.resolve()
-        ):
-            return JSONResponse({"error": "not found"}, status_code=404)
-        prefix = _normalise_prefix(request.headers.get("x-forwarded-prefix"))
-        css = css_path.read_text()
-        if prefix:
-            for asset_dir in ("/fonts/", "/fonts-terminal/", "/ds-assets/", "/assets/"):
-                css = css.replace(f"url({asset_dir}", f"url({prefix}{asset_dir}")
-                css = css.replace(f"url(\"{asset_dir}", f"url(\"{prefix}{asset_dir}")
-                css = css.replace(f"url('{asset_dir}", f"url('{prefix}{asset_dir}")
-        return Response(content=css, media_type="text/css")
-
     application.mount("/assets", StaticFiles(directory=WEB_DIST / "assets"), name="assets")
 
     @application.get("/{full_path:path}")
-    async def serve_spa(full_path: str, request: Request):
-        prefix = _normalise_prefix(request.headers.get("x-forwarded-prefix"))
+    async def serve_spa(full_path: str):
         file_path = WEB_DIST / full_path
         # Prevent path traversal via url-encoded sequences (%2e%2e/)
         if (
@@ -3421,7 +3526,7 @@ def mount_spa(application: FastAPI):
             and file_path.is_file()
         ):
             return FileResponse(file_path)
-        return _serve_index(prefix)
+        return _serve_index()
 
 
 # ---------------------------------------------------------------------------

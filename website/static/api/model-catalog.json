@@ -69,10 +69,6 @@
           "description": "free"
         },
         {
-          "id": "tencent/hy3-preview",
-          "description": ""
-        },
-        {
           "id": "openai/gpt-5.3-codex",
           "description": ""
         },

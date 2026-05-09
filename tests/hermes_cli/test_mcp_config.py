@@ -43,7 +43,7 @@ def _make_args(**kwargs):
     defaults = {
         "name": "test-server",
         "url": None,
-        "mcp_command": None,
+        "command": None,
         "args": None,
         "auth": None,
         "preset": None,
@@ -233,7 +233,7 @@ class TestMcpAdd:
 
         cmd_mcp_add(_make_args(
             name="github",
-            mcp_command="npx",
+            command="npx",
             args=["@mcp/github"],
         ))
         out = capsys.readouterr().out
@@ -291,7 +291,7 @@ class TestMcpAdd:
 
         cmd_mcp_add(_make_args(
             name="github",
-            mcp_command="npx",
+            command="npx",
             args=["@mcp/github"],
             env=["MY_API_KEY=secret123", "DEBUG=true"],
         ))
@@ -313,7 +313,7 @@ class TestMcpAdd:
 
         cmd_mcp_add(_make_args(
             name="github",
-            mcp_command="npx",
+            command="npx",
             args=["@mcp/github"],
             env=["BAD-NAME=value"],
         ))
@@ -390,7 +390,7 @@ class TestMcpAdd:
         cmd_mcp_add(_make_args(
             name="custom",
             preset="testmcp",
-            mcp_command="uvx",
+            command="uvx",
             args=["custom-server"],
         ))
         out = capsys.readouterr().out

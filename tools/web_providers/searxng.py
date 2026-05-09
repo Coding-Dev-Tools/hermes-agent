@@ -5,11 +5,10 @@ It implements ``WebSearchProvider`` only — there is no extract capability.
 
 Configuration::
 
-    # ~/.hermes/.env
-    SEARXNG_URL=http://localhost:8080
+    # ~/.hermes/config.yaml  (SEARXNG_URL is a URL, not a secret — use config.yaml not .env)
+    SEARXNG_URL: http://localhost:8080
 
     # Use SearXNG for search, pair with any extract provider:
-    # ~/.hermes/config.yaml
     web:
       search_backend: "searxng"
       extract_backend: "firecrawl"

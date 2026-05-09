@@ -1,23 +1,37 @@
-import js from '@eslint/js'
-import globals from 'globals'
-import reactHooks from 'eslint-plugin-react-hooks'
-import reactRefresh from 'eslint-plugin-react-refresh'
-import tseslint from 'typescript-eslint'
-import { defineConfig, globalIgnores } from 'eslint/config'
+//  @ts-check
 
-export default defineConfig([
-  globalIgnores(['dist']),
+import { tanstackConfig } from '@tanstack/eslint-config'
+
+export default [
+  ...tanstackConfig,
   {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      js.configs.recommended,
-      tseslint.configs.recommended,
-      reactHooks.configs.flat.recommended,
-      reactRefresh.configs.vite,
-    ],
-    languageOptions: {
-      ecmaVersion: 2020,
-      globals: globals.browser,
+    ignores: ['eslint.config.js', 'prettier.config.js', 'vite.config.ts'],
+  },
+  {
+    // Block client-side imports of server-only MCP input types.
+    // `src/types/mcp-input.ts` may carry secret-bearing fields and must
+    // never be referenced from screens or shared components.
+    files: ['src/screens/**/*.{ts,tsx}', 'src/components/**/*.{ts,tsx}'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          paths: [
+            {
+              name: '@/types/mcp-input',
+              message:
+                'mcp-input.ts is server-only (carries unmasked secrets). Import McpClientInput from @/types/mcp instead.',
+            },
+          ],
+          patterns: [
+            {
+              group: ['**/types/mcp-input', '**/types/mcp-input.ts'],
+              message:
+                'mcp-input.ts is server-only (carries unmasked secrets). Import McpClientInput from @/types/mcp instead.',
+            },
+          ],
+        },
+      ],
     },
   },
-])
+]

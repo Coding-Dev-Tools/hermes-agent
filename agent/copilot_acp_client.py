@@ -477,8 +477,8 @@ class CopilotACPClient:
             proc.stdin.write(json.dumps(payload) + "\n")
             proc.stdin.flush()
 
-            deadline = time.monotonic() + timeout_seconds
-            while time.monotonic() < deadline:
+            deadline = time.time() + timeout_seconds
+            while time.time() < deadline:
                 if proc.poll() is not None:
                     break
                 try:

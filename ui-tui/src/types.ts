@@ -160,15 +160,12 @@ export interface SessionInfo {
 
 export interface Usage {
   calls: number
-  compressions?: number
   context_max?: number
   context_percent?: number
   context_used?: number
-  cost_status?: string
   cost_usd?: number
   input: number
   output: number
-  reasoning?: number
   total: number
 }
 
